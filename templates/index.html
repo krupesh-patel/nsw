@@ -1,0 +1,354 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>NSW Strata Search</title>
+    <style>
+        body { font-family: sans-serif; margin: 20px; }
+        .controls-container { margin-bottom: 15px; display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+        form div { margin-bottom: 10px; }
+        label { display: inline-block; width: 80px; }
+        input[type="text"] { width: 200px; padding: 5px; }
+        button { padding: 8px 15px; margin-right: 10px; cursor: pointer; }
+        #resultsTableContainer { margin-top: 20px; }
+        #resultsTable { border-collapse: collapse; width: 100%; }
+        #resultsTable th, #resultsTable td { border: 1px solid #ddd; padding: 8px; text-align: left; }
+        #resultsTable th { background-color: #f2f2f2; }
+        #status { margin-top: 15px; font-weight: bold; }
+        .error { color: red; }
+        .loading { color: blue; }
+        .hidden { display: none; }
+        #viewToggleButton { background-color: #e0e0e0; }
+        #buildingsGE20LotsButton { background-color: #d0d0f0; } /* Style for new button */
+        #streetsGE20LotsButton { background-color: #e0e0e0; }
+    </style>
+</head>
+<body>
+
+    <h1>NSW Strata Plan Search</h1>
+
+    <form id="searchForm">
+        <div>
+            <label for="suburb">Suburb:</label>
+            <input type="text" id="suburb" name="suburb" required placeholder="Enter NSW Suburb">
+        </div>
+        <button type="submit">Search</button>
+    </form>
+
+    <div id="status"></div>
+
+    <div class="controls-container">
+        <button id="viewToggleButton" class="hidden">Switch to Street View</button>
+        <button id="buildingsGE20LotsButton" class="hidden">Buildings >= 20 Lots</button> 
+        <button id="streetsGE20LotsButton" class="hidden">Streets >= 20 Lots</button> 
+        <button id="exportButton" class="hidden">Export Results as CSV</button>
+    </div>
+
+    <div id="resultsTableContainer">
+        <table id="resultsTable" class="hidden">
+            <thead id="resultsTableHead">
+                <!-- Headers will be populated by JavaScript -->
+            </thead>
+            <tbody id="resultsBody">
+                <!-- Results will be populated here -->
+            </tbody>
+        </table>
+    </div>
+
+    <script>
+        const form = document.getElementById("searchForm");
+        const statusDiv = document.getElementById("status");
+        const resultsTable = document.getElementById("resultsTable");
+        const resultsTableHead = document.getElementById("resultsTableHead");
+        const resultsBody = document.getElementById("resultsBody");
+        const exportButton = document.getElementById("exportButton");
+        const viewToggleButton = document.getElementById("viewToggleButton");
+        const buildingsGE20LotsButton = document.getElementById("buildingsGE20LotsButton"); // New button for filtered buildings
+        const streetsGE20LotsButton = document.getElementById("streetsGE20LotsButton");
+        
+        let currentSearchParams = "";
+        let currentView = "building"; // "building", "street", "building_ge20_lots", or "street_ge20_lots"
+        let rawBuildingData = []; // To store data for full building view
+
+        function parseStreetAddressForBuildingView(rawAddress, rawSuburb) {
+            let addressForParsing = rawAddress || "";
+            const itemSuburbName = rawSuburb || "";
+            if (itemSuburbName) {
+                const suffixComma = `, ${itemSuburbName}`;
+                if (addressForParsing.toUpperCase().endsWith(suffixComma.toUpperCase())) {
+                    addressForParsing = addressForParsing.substring(0, addressForParsing.length - suffixComma.length).trim();
+                } else {
+                    const suffixSpace = ` ${itemSuburbName}`;
+                    if (addressForParsing.toUpperCase().endsWith(suffixSpace.toUpperCase())) {
+                        addressForParsing = addressForParsing.substring(0, addressForParsing.length - suffixSpace.length).trim();
+                    }
+                }
+            }
+            const match = addressForParsing.match(/^(\d+[A-Za-z]?(?:-\d+[A-Za-z]?)?)\s+(.*)/);
+            let streetNumber = Infinity;
+            let streetNamePart = addressForParsing.toUpperCase().trim(); 
+            if (match) {
+                const numberPart = match[1];
+                const primaryNumberMatch = numberPart.match(/^\d+/);
+                streetNumber = primaryNumberMatch ? parseInt(primaryNumberMatch[0], 10) : Infinity;
+                streetNamePart = match[2].toUpperCase().trim();
+            }
+            return { number: streetNumber, name: streetNamePart, original: addressForParsing };
+        }
+
+        function setTableHeaders(viewType) {
+            resultsTableHead.innerHTML = "";
+            const headerRow = resultsTableHead.insertRow();
+            let headers = [];
+            if (viewType === "building" || viewType === "building_ge20_lots") {
+                headers = ["Record #", "Plan Label", "Street Address", "Suburb", "Postcode", "LGA", "Lots", "Sum of Lots per Street (>=20 Lot Bldgs)", "Cumulative Lots (>=20 Lot Bldgs)"];
+            } else { // "street" or "street_ge20_lots" view
+                headers = ["Record #", "Street Name", "Building Count", "Total Lots on Street", "Cumulative Lots (across streets)"];
+            }
+            headers.forEach(headerText => {
+                const th = document.createElement("th");
+                th.textContent = headerText;
+                headerRow.appendChild(th);
+            });
+        }
+
+        // For full building view - calculates sums client-side
+        function renderBuildingView(data) {
+            setTableHeaders("building");
+            resultsBody.innerHTML = "";
+            if (!data || data.length === 0) return;
+
+            const streetNameLotsSum = {};
+            data.forEach(item => {
+                const parsedAddress = parseStreetAddressForBuildingView(item.address, item.suburb);
+                const streetName = parsedAddress.name;
+                const lots = parseInt(item.lottotal) || 0;
+                streetNameLotsSum[streetName] = (streetNameLotsSum[streetName] || 0) + lots;
+            });
+
+            const sortedData = [...data].sort((a, b) => {
+                const lotsA = parseInt(a.lottotal) || 0;
+                const lotsB = parseInt(b.lottotal) || 0;
+                return lotsB - lotsA;
+            });
+
+            let recordCounter = 0;
+            let cumulativeLots = 0;
+            sortedData.forEach(item => {
+                recordCounter++;
+                const currentLots = parseInt(item.lottotal) || 0;
+                cumulativeLots += currentLots;
+                const parsedForDisplay = parseStreetAddressForBuildingView(item.address, item.suburb);
+                const streetAddressForDisplay = parsedForDisplay.original;
+                const sumForThisStreet = streetNameLotsSum[parsedForDisplay.name] || 0;
+
+                const row = resultsBody.insertRow();
+                row.insertCell().textContent = recordCounter;
+                row.insertCell().textContent = item.planlabel || "N/A";
+                row.insertCell().textContent = streetAddressForDisplay || "N/A";
+                row.insertCell().textContent = item.suburb || "N/A";
+                row.insertCell().textContent = item.postcode || "N/A";
+                row.insertCell().textContent = item.lga || "N/A";
+                row.insertCell().textContent = currentLots;
+                row.insertCell().textContent = sumForThisStreet; // Sum of ALL lots on that street
+                row.insertCell().textContent = cumulativeLots; // Cumulative of ALL lots in view
+            });
+        }
+
+        // For filtered building view (>= 20 lots) - uses pre-calculated sums from backend
+        function renderFilteredBuildingView(data) {
+            setTableHeaders("building_ge20_lots"); // Uses same headers as building view, but content is different
+            resultsBody.innerHTML = "";
+            if (!data || data.length === 0) return;
+
+            // Data is already filtered and sorted by lottotal DESC from backend
+            // It also includes pre-calculated sum_of_lots_per_street and cumulative_lots for the filtered set
+            let recordCounter = 0;
+            data.forEach(item => {
+                recordCounter++;
+                const currentLots = parseInt(item.lottotal) || 0; // This will be >= 20
+                const parsedForDisplay = parseStreetAddressForBuildingView(item.address, item.suburb);
+                const streetAddressForDisplay = parsedForDisplay.original;
+
+                const row = resultsBody.insertRow();
+                row.insertCell().textContent = recordCounter;
+                row.insertCell().textContent = item.planlabel || "N/A";
+                row.insertCell().textContent = streetAddressForDisplay || "N/A";
+                row.insertCell().textContent = item.suburb || "N/A";
+                row.insertCell().textContent = item.postcode || "N/A";
+                row.insertCell().textContent = item.lga || "N/A";
+                row.insertCell().textContent = currentLots;
+                row.insertCell().textContent = item.sum_of_lots_per_street || 0; // Pre-calculated sum for >=20 lot bldgs on this street
+                row.insertCell().textContent = item.cumulative_lots || 0;      // Pre-calculated cumulative for >=20 lot bldgs in view
+            });
+        }
+
+        function renderStreetView(data, viewType = "street") {
+            setTableHeaders(viewType); 
+            resultsBody.innerHTML = "";
+            if (!data || data.length === 0) return;
+            let recordCounter = 0;
+            data.forEach(item => {
+                recordCounter++;
+                const row = resultsBody.insertRow();
+                row.insertCell().textContent = recordCounter;
+                row.insertCell().textContent = item.street_name || "N/A";
+                row.insertCell().textContent = item.property_count || 0;
+                row.insertCell().textContent = item.total_lots_on_street || 0;
+                row.insertCell().textContent = item.cumulative_lots || 0;
+            });
+        }
+
+        async function performSearch(suburbQuery) {
+            statusDiv.textContent = "Searching...";
+            statusDiv.className = "loading";
+            resultsTable.classList.add("hidden");
+            exportButton.classList.add("hidden");
+            viewToggleButton.classList.add("hidden");
+            buildingsGE20LotsButton.classList.add("hidden"); 
+            streetsGE20LotsButton.classList.add("hidden");
+            resultsBody.innerHTML = "";
+            rawBuildingData = [];
+
+            try {
+                const response = await fetch(`/api/search?${suburbQuery}`);
+                const data = await response.json();
+                rawBuildingData = data;
+
+                if (!response.ok) {
+                    throw new Error(data.error || `HTTP error! status: ${response.status}`);
+                }
+
+                if (data && data.length > 0) {
+                    statusDiv.textContent = `Found ${data.length} buildings.`;
+                    statusDiv.className = "";
+                    resultsTable.classList.remove("hidden");
+                    exportButton.classList.remove("hidden");
+                    viewToggleButton.classList.remove("hidden");
+                    buildingsGE20LotsButton.classList.remove("hidden");
+                    streetsGE20LotsButton.classList.remove("hidden");
+                    currentView = "building";
+                    viewToggleButton.textContent = "Switch to Street View";
+                    renderBuildingView(rawBuildingData);
+                } else {
+                    statusDiv.textContent = "No results found for your criteria.";
+                    statusDiv.className = "";
+                }
+            } catch (error) {
+                console.error("Search error:", error);
+                statusDiv.textContent = `Error: ${error.message}`;
+                statusDiv.className = "error";
+                rawBuildingData = [];
+            }
+        }
+
+        form.addEventListener("submit", async (event) => {
+            event.preventDefault();
+            const formData = new FormData(form);
+            const params = new URLSearchParams();
+            const suburbValue = formData.get("suburb");
+            if (suburbValue) {
+                params.append("suburb", suburbValue);
+            } else {
+                statusDiv.textContent = "Please enter a suburb name.";
+                statusDiv.className = "error";
+                return;
+            }
+            currentSearchParams = params.toString();
+            await performSearch(currentSearchParams);
+        });
+
+        viewToggleButton.addEventListener("click", async () => {
+            if (currentView === "building" || currentView === "building_ge20_lots") {
+                // Switch to Full Street View
+                statusDiv.textContent = "Loading street view...";
+                statusDiv.className = "loading";
+                try {
+                    const response = await fetch(`/api/search_street_level?${currentSearchParams}`);
+                    const streetData = await response.json();
+                    if (!response.ok) throw new Error(streetData.error || `HTTP error! status: ${response.status}`);
+                    renderStreetView(streetData, "street");
+                    currentView = "street";
+                    viewToggleButton.textContent = "Switch to Building View";
+                    statusDiv.textContent = `Displaying ${streetData.length} streets.`;
+                    statusDiv.className = "";
+                } catch (error) {
+                    console.error("Street view error:", error);
+                    statusDiv.textContent = `Error loading street view: ${error.message}`;
+                    statusDiv.className = "error";
+                }
+            } else { // currentView is "street" or "street_ge20_lots"
+                // Switch back to Full Building View
+                renderBuildingView(rawBuildingData);
+                currentView = "building";
+                viewToggleButton.textContent = "Switch to Street View";
+                statusDiv.textContent = `Displaying ${rawBuildingData.length} buildings.`;
+                statusDiv.className = "";
+                exportButton.classList.remove("hidden");
+            }
+        });
+
+        buildingsGE20LotsButton.addEventListener("click", async () => {
+            statusDiv.textContent = "Loading buildings with >= 20 lots...";
+            statusDiv.className = "loading";
+            try {
+                const response = await fetch(`/api/search_buildings_ge20_lots?${currentSearchParams}`);
+                const filteredBuildingData = await response.json();
+                if (!response.ok) throw new Error(filteredBuildingData.error || `HTTP error! status: ${response.status}`);
+                renderFilteredBuildingView(filteredBuildingData);
+                currentView = "building_ge20_lots";
+                viewToggleButton.textContent = "Switch to Street View"; // Consistent with being a building-type view
+                statusDiv.textContent = `Displaying ${filteredBuildingData.length} buildings with 20 or more lots.`;
+                statusDiv.className = "";
+                // exportButton.classList.add("hidden"); // REMOVED: Export should be available
+                exportButton.classList.remove("hidden"); // ADDED: Ensure export button is visible
+            } catch (error) {
+                console.error("Buildings >= 20 lots view error:", error);
+                statusDiv.textContent = `Error loading buildings with >= 20 lots: ${error.message}`;
+                statusDiv.className = "error";
+            }
+        });
+
+        streetsGE20LotsButton.addEventListener("click", async () => {
+            statusDiv.textContent = "Loading streets with >= 20 lots...";
+            statusDiv.className = "loading";
+            try {
+                const response = await fetch(`/api/search_street_level_ge20_lots?${currentSearchParams}`);
+                const streetDataGE20 = await response.json();
+                if (!response.ok) throw new Error(streetDataGE20.error || `HTTP error! status: ${response.status}`);
+                renderStreetView(streetDataGE20, "street_ge20_lots");
+                currentView = "street_ge20_lots";
+                viewToggleButton.textContent = "Switch to Building View"; 
+                statusDiv.textContent = `Displaying ${streetDataGE20.length} streets with 20 or more lots.`;
+                statusDiv.className = "";
+            } catch (error) {
+                console.error("Streets >= 20 lots view error:", error);
+                statusDiv.textContent = `Error loading streets with >= 20 lots: ${error.message}`;
+                statusDiv.className = "error";
+            }
+        });
+
+        exportButton.addEventListener("click", () => {
+            if (currentSearchParams) {
+                // Export based on current view
+                let exportUrl = "";
+                if (currentView === "building") {
+                    exportUrl = `/api/export?${currentSearchParams}&view=building`;
+                } else if (currentView === "building_ge20_lots") {
+                    exportUrl = `/api/export?${currentSearchParams}&view=building_ge20_lots`;
+                } else if (currentView === "street") {
+                    exportUrl = `/api/export?${currentSearchParams}&view=street`;
+                } else if (currentView === "street_ge20_lots") {
+                    exportUrl = `/api/export?${currentSearchParams}&view=street_ge20_lots`;
+                }
+                if (exportUrl) {
+                    window.location.href = exportUrl;
+                }
+            }
+        });
+    </script>
+
+</body>
+</html>
+
